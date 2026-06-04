@@ -158,10 +158,25 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.resolve.outputs.artifact-name }}
-          path: deploy-staging/
+        shell: pwsh
+        run: |
+          $artifactName = '${{ needs.resolve.outputs.artifact-name }}'
+          New-Item -ItemType Directory -Force -Path deploy-staging | Out-Null
+
+          # Find the artifact across all runs in this repo
+          $artifact = gh api repos/qumbarraza/Bullfrog.RMSAPI/actions/artifacts `
+            --jq ".artifacts[] | select(.name == ""$artifactName"") | select(.expired == false) | {id: .id, run: .workflow_run.id}" `
+            | ConvertFrom-Json | Select-Object -First 1
+
+          if (-not $artifact) {
+            throw "Artifact '$artifactName' not found or expired across all runs"
+          }
+
+          Write-Host "Found artifact ID $($artifact.id) from run $($artifact.run)"
+          gh api repos/qumbarraza/Bullfrog.RMSAPI/actions/artifacts/$($artifact.id)/zip -H "Accept: application/vnd.github+json" > artifact.zip
+          Expand-Archive artifact.zip -DestinationPath deploy-staging/ -Force
+          Remove-Item artifact.zip
+          Write-Host "Artifact downloaded and extracted to deploy-staging/"
 
       - name: Strip environment-managed config
         uses: ./.github/actions/strip-env-config
