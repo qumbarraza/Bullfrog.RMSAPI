@@ -13,6 +13,9 @@ obj/
 *.userosscache
 *.sln.docstates
 
+# Third-party local dependencies (not committed)
+libs/
+
 # NuGet
 *.nupkg
 project.nuget.cache
