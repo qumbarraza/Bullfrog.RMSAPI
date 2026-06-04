@@ -149,7 +149,9 @@ jobs:
       - name: Stop application pool
         shell: pwsh
         run: |
+          Import-Module WebAdministration
           Stop-WebAppPool -Name '${{ vars.APP_POOL }}'
+          Write-Host "App pool '${{ vars.APP_POOL }}' stopped"
 
       - name: Deploy files via robocopy
         shell: pwsh
@@ -166,7 +168,9 @@ jobs:
       - name: Start application pool
         shell: pwsh
         run: |
+          Import-Module WebAdministration
           Start-WebAppPool -Name '${{ vars.APP_POOL }}'
+          Write-Host "App pool '${{ vars.APP_POOL }}' started"
 
       - name: Health check
         if: vars.HEALTH_CHECK_URL != ''
