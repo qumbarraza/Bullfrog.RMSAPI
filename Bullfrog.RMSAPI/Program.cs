@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Bullfrog;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
@@ -30,6 +31,9 @@ app.MapGet("/info", () =>
         version     = versionInfo
     });
 });
+
+// Served from Bullfrog class library — proves the shared lib change is picked up
+app.MapGet("/spa", () => Results.Ok(SpaInfo.GetIdentity()));
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
 
