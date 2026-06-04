@@ -1,0 +1,22 @@
+## Visual Studio / .NET gitignore
+
+# Build output
+bin/
+obj/
+
+# VS hidden folder
+.vs/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+project.nuget.cache
+
+# OS
+Thumbs.db
+.DS_Store
