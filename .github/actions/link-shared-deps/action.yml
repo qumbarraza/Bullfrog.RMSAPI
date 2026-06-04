@@ -18,6 +18,8 @@ runs:
   using: composite
   steps:
     - uses: actions/checkout@v4
+      env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       with:
         repository: qumbarraza/Bullfrog
         token: ${{ inputs.bullfrog-token }}

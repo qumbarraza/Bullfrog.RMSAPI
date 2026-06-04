@@ -4,6 +4,9 @@ permissions:
   contents: read
   pull-requests: write  # required for gh pr comment in notify-pr job
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   workflow_dispatch:
     inputs:
