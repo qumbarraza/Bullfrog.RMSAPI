@@ -7,7 +7,7 @@ app.MapGet("/", () => Results.Ok(new
 {
     app     = "Bullfrog.RMSAPI",
     status  = "running",
-    message = "Mock RMS API is live"
+    message = "Mock RMS API is live - final testing"
 }));
 
 app.MapGet("/info", () =>
