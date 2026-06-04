@@ -149,7 +149,7 @@ jobs:
       - name: Stop application pool
         shell: pwsh
         run: |
-          Import-Module WebAdministration
+          Import-Module WebAdministration -SkipEditionCheck
           Stop-WebAppPool -Name '${{ vars.APP_POOL }}'
           Write-Host "App pool '${{ vars.APP_POOL }}' stopped"
 
@@ -168,7 +168,7 @@ jobs:
       - name: Start application pool
         shell: pwsh
         run: |
-          Import-Module WebAdministration
+          Import-Module WebAdministration -SkipEditionCheck
           Start-WebAppPool -Name '${{ vars.APP_POOL }}'
           Write-Host "App pool '${{ vars.APP_POOL }}' started"
 
