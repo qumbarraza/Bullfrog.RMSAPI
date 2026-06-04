@@ -150,14 +150,25 @@ jobs:
         shell: pwsh
         run: |
           $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
-          $state = & $appcmd list apppool /apppool.name:'${{ vars.APP_POOL }}' /processModel.userName /state
+          $state = & $appcmd list apppool /apppool.name:'${{ vars.APP_POOL }}'
           if ($state -match 'state:Started') {
             & $appcmd stop apppool /apppool.name:'${{ vars.APP_POOL }}'
             if ($LASTEXITCODE -ne 0) { throw "appcmd stop apppool failed with exit code $LASTEXITCODE" }
-            Write-Host "App pool '${{ vars.APP_POOL }}' stopped"
+            Write-Host "App pool '${{ vars.APP_POOL }}' stopped — waiting for worker process to exit..."
           } else {
-            Write-Host "App pool '${{ vars.APP_POOL }}' was already stopped — skipping"
+            Write-Host "App pool '${{ vars.APP_POOL }}' was already stopped"
           }
+
+          # Wait for w3wp.exe to fully release file locks (up to 30s)
+          $maxWait = 30
+          $waited  = 0
+          while ($waited -lt $maxWait) {
+            $workers = Get-Process -Name w3wp -ErrorAction SilentlyContinue
+            if (-not $workers) { Write-Host "w3wp.exe exited after ${waited}s"; break }
+            Start-Sleep -Seconds 2
+            $waited += 2
+          }
+          if ($waited -ge $maxWait) { Write-Host "Warning: w3wp.exe still running after ${maxWait}s, proceeding anyway" }
           $global:LASTEXITCODE = 0
 
       - name: Deploy files via robocopy
