@@ -1,1 +1,284 @@
-C:\Users\PC\Desktop\mock RMSAPI\.github\workflows\deploy-branch.yml
+name: Deploy - Branch to Environment (Pre-Merge)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - vm-dev
+      branch:
+        description: Branch name to deploy (leave empty for current default branch)
+        required: false
+        type: string
+        default: ''
+      reuse-ci-artifact:
+        description: Reuse existing CI artifact if available (skip rebuild)
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  resolve:
+    runs-on: [self-hosted, build]
+    outputs:
+      use-ci-artifact: ${{ steps.resolve.outputs.use-ci-artifact }}
+      artifact-name: ${{ steps.resolve.outputs.artifact-name }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      branch-safe: ${{ steps.resolve.outputs.branch-safe }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Resolve branch and artifact
+        id: resolve
+        shell: pwsh
+        run: |
+          $branch = '${{ inputs.branch }}'.Trim()
+          if ($branch -eq '') { $branch = '${{ github.ref_name }}' }
+
+          # Resolve SHA for branch
+          $sha = gh api repos/qumbarraza/Bullfrog.RMSAPI/branches/$branch --jq '.commit.sha' 2>$null
+          if (-not $sha) { $sha = '${{ github.sha }}' }
+          $sha7 = $sha.Substring(0, 7)
+
+          # Sanitize branch name
+          $branchSafe = ($branch -replace '[^a-zA-Z0-9\-]', '-') -replace '-+', '-'
+          if ($branchSafe.Length -gt 50) { $branchSafe = $branchSafe.Substring(0, 50) }
+
+          $version = "1.0.${{ github.run_number }}-pr.$branchSafe+$sha7"
+
+          # Check for existing CI artifact
+          $useCi = 'false'
+          $artifactName = "rmsapi-branch-$version"
+          if ('${{ inputs.reuse-ci-artifact }}' -eq 'true') {
+            $ciName = "ci-publish-$sha"
+            $found = gh api repos/qumbarraza/Bullfrog.RMSAPI/actions/artifacts --jq ".artifacts[] | select(.name == ""$ciName"") | select(.expired == false) | .name" 2>$null
+            if ($found) {
+              $useCi = 'true'
+              $artifactName = $ciName
+              Write-Host "Reusing CI artifact: $ciName"
+            } else {
+              Write-Host "CI artifact not found or expired, will rebuild"
+            }
+          }
+
+          echo "use-ci-artifact=$useCi" >> $env:GITHUB_OUTPUT
+          echo "artifact-name=$artifactName" >> $env:GITHUB_OUTPUT
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "sha=$sha" >> $env:GITHUB_OUTPUT
+          echo "branch-safe=$branchSafe" >> $env:GITHUB_OUTPUT
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.use-ci-artifact == 'false'
+    runs-on: [self-hosted, build]
+    outputs:
+      artifact-name: ${{ steps.upload.outputs.artifact-name }}
+    steps:
+      - name: Sparse checkout .github
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: Bullfrog.RMSAPI
+
+      - name: Link shared deps
+        id: link-deps
+        uses: ./.github/actions/link-shared-deps
+        with:
+          bullfrog-token: ${{ secrets.BULLFROG_REPO_TOKEN }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+        env:
+          DOTNET_INSTALL_DIR: C:\actions-runner\_work\dotnet
+
+      - name: dotnet restore
+        run: dotnet restore Bullfrog.RMSAPI/Bullfrog.RMSAPI.sln
+
+      - name: dotnet build
+        run: dotnet build Bullfrog.RMSAPI/Bullfrog.RMSAPI.sln -c Release --no-restore
+
+      - name: dotnet publish
+        run: dotnet publish Bullfrog.RMSAPI/Bullfrog.RMSAPI/Bullfrog.RMSAPI.csproj -c Release --no-build -o publish_output
+
+      - name: Strip env-managed DLLs
+        shell: pwsh
+        run: |
+          $dll = Join-Path "publish_output" "ThirdParty.Dummy.dll"
+          [System.IO.File]::Delete($dll)
+          if ([System.IO.File]::Exists($dll)) { throw "Failed to strip ThirdParty.Dummy.dll" }
+          Write-Host "Stripped ThirdParty.Dummy.dll"
+
+      - name: Write version.json
+        shell: pwsh
+        run: |
+          $v = @{
+            version       = "${{ needs.resolve.outputs.version }}"
+            "rmsapi-sha"  = "${{ needs.resolve.outputs.sha }}"
+            "bullfrog-sha"= "${{ steps.link-deps.outputs.bullfrog-sha }}"
+            branch        = "${{ inputs.branch }}"
+            "run-number"  = "${{ github.run_number }}"
+          }
+          $v | ConvertTo-Json | Set-Content publish_output/version.json
+
+      - name: Upload artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.resolve.outputs.artifact-name }}
+          path: publish_output/
+          retention-days: 14
+
+  deploy:
+    needs: [resolve, build]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: [self-hosted, "${{ inputs.environment }}"]
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Sparse checkout .github
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - name: Download artifact
+        shell: pwsh
+        run: |
+          $artifactName = '${{ needs.resolve.outputs.artifact-name }}'
+          New-Item -ItemType Directory -Force -Path deploy-staging | Out-Null
+
+          # Find the artifact across all runs in this repo
+          $artifact = gh api repos/qumbarraza/Bullfrog.RMSAPI/actions/artifacts `
+            --jq ".artifacts[] | select(.name == ""$artifactName"") | select(.expired == false) | {id: .id, run: .workflow_run.id}" `
+            | ConvertFrom-Json | Select-Object -First 1
+
+          if (-not $artifact) {
+            throw "Artifact '$artifactName' not found or expired across all runs"
+          }
+
+          Write-Host "Found artifact ID $($artifact.id) from run $($artifact.run)"
+          gh api repos/qumbarraza/Bullfrog.RMSAPI/actions/artifacts/$($artifact.id)/zip -H "Accept: application/vnd.github+json" > artifact.zip
+          Expand-Archive artifact.zip -DestinationPath deploy-staging/ -Force
+          Remove-Item artifact.zip
+          Write-Host "Artifact downloaded and extracted to deploy-staging/"
+
+      - name: Strip environment-managed config
+        uses: ./.github/actions/strip-env-config
+        with:
+          deploy-path: deploy-staging/
+
+      - name: Stop application pool
+        shell: pwsh
+        run: |
+          $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
+          $state = & $appcmd list apppool /apppool.name:'${{ vars.APP_POOL }}'
+          if ($state -match 'state:Started') {
+            & $appcmd stop apppool /apppool.name:'${{ vars.APP_POOL }}'
+            if ($LASTEXITCODE -ne 0) { throw "appcmd stop failed with exit code $LASTEXITCODE" }
+            Write-Host "App pool stopped"
+          } else {
+            Write-Host "App pool was already stopped"
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: Deploy files via robocopy
+        shell: pwsh
+        run: |
+          $src = 'deploy-staging\'
+          $dst = '${{ vars.SITE_PATH }}'
+          robocopy $src $dst /E /NFL /NDL /NJH /NJS
+          $rc = $LASTEXITCODE
+          if ($rc -ge 8) { throw "robocopy failed with exit code $rc" }
+          Write-Host "robocopy completed with exit code $rc (success)"
+          $global:LASTEXITCODE = 0
+
+      - name: Start application pool
+        shell: pwsh
+        run: |
+          $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
+          & $appcmd start apppool /apppool.name:'${{ vars.APP_POOL }}'
+          if ($LASTEXITCODE -ne 0) { throw "appcmd start failed with exit code $LASTEXITCODE" }
+          Write-Host "App pool started"
+          $global:LASTEXITCODE = 0
+
+      - name: Record deployment
+        id: record
+        uses: ./.github/actions/record-deployment
+        with:
+          version: ${{ needs.resolve.outputs.version }}
+          environment: ${{ inputs.environment }}
+          action-type: branch
+          actor: ${{ github.actor }}
+          commit: ${{ needs.resolve.outputs.sha }}
+          branch: ${{ inputs.branch }}
+
+      - name: Warn if environment in use
+        shell: pwsh
+        run: |
+          $priorActor  = '${{ steps.record.outputs.prior-actor }}'
+          $priorTs     = '${{ steps.record.outputs.prior-ts }}'
+          $currentActor = '${{ github.actor }}'
+          if ($priorActor -and $priorTs -and $priorActor -ne $currentActor) {
+            $prior = [datetime]::Parse($priorTs)
+            $diff  = (Get-Date).ToUniversalTime() - $prior.ToUniversalTime()
+            if ($diff.TotalMinutes -lt 30) {
+              Write-Host "::warning::Environment vm-dev was deployed by $priorActor only $([int]$diff.TotalMinutes) minute(s) ago. Coordinate to avoid conflicts."
+            }
+          }
+
+      - name: Write job summary
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## Branch Deploy Summary
+          | Field       | Value |
+          |-------------|-------|
+          | Environment | ${{ inputs.environment }} |
+          | Branch      | ${{ inputs.branch }} |
+          | Version     | ${{ needs.resolve.outputs.version }} |
+          | Artifact    | ${{ needs.resolve.outputs.artifact-name }} |
+          | Reused CI   | ${{ needs.resolve.outputs.use-ci-artifact }} |
+          | Actor       | ${{ github.actor }} |
+          | Public URL  | ${{ vars.PUBLIC_URL }} |
+          "@
+          $summary >> $env:GITHUB_STEP_SUMMARY
+
+  notify-pr:
+    needs: [resolve, deploy]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: [self-hosted, build]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Comment on PR
+        shell: pwsh
+        run: |
+          $branch = '${{ inputs.branch }}'.Trim()
+          $pr = gh pr list --repo qumbarraza/Bullfrog.RMSAPI --head $branch --state open --json number --jq '.[0].number' 2>$null
+          if ($pr) {
+            $status  = '${{ needs.deploy.result }}'
+            $icon    = if ($status -eq 'success') { 'rocket' } else { 'x' }
+            $version = '${{ needs.resolve.outputs.version }}'
+            $sha7    = '${{ needs.resolve.outputs.sha }}'.Substring(0,7)
+            $body    = ":$icon`: Branch ``$branch`` @ ``$sha7`` deployed to **${{ inputs.environment }}``\n> Version: ``$version`` | Actor: @${{ github.actor }} | Status: $status"
+            gh pr comment $pr --repo qumbarraza/Bullfrog.RMSAPI --body $body
+            Write-Host "Commented on PR #$pr"
+          } else {
+            Write-Host "No open PR found for branch $branch"
+          }
