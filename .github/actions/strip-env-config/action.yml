@@ -1,13 +1,14 @@
 name: Strip Environment-Managed Config
+description: Remove VM-owned config files from deploy-staging so they are never overwritten on the target server.
 
 inputs:
   deploy-path:
     required: true
-    description: Path to the deployment directory
+    description: Path to the deployment staging directory
   extra-files:
     required: false
     default: ''
-    description: CSV of additional files to strip
+    description: CSV of additional filenames to strip (e.g. "web.config,secrets.json")
 
 runs:
   using: composite
@@ -15,18 +16,29 @@ runs:
     - name: Strip environment-managed config files
       shell: pwsh
       run: |
+        # Files always stripped (VM owns these — never deploy over them)
         $files = @('appsettings.json')
+
+        # Merge any extra-files input
         if ('${{ inputs.extra-files }}' -ne '') {
           '${{ inputs.extra-files }}'.Split(',') | ForEach-Object {
             $trimmed = $_.Trim()
             if ($trimmed -ne '') { $files += $trimmed }
           }
         }
+
+        $deployPath = '${{ inputs.deploy-path }}'
         foreach ($file in $files) {
-          $fullPath = Join-Path '${{ inputs.deploy-path }}' $file
-          [System.IO.File]::Delete($fullPath)
+          $fullPath = Join-Path $deployPath $file
           if ([System.IO.File]::Exists($fullPath)) {
-            throw "Failed to delete $fullPath"
+            [System.IO.File]::Delete($fullPath)
+            # Guard: verify deletion succeeded (silent failure on ~ paths)
+            if ([System.IO.File]::Exists($fullPath)) {
+              throw "Failed to delete '$fullPath' — file still present after deletion."
+            }
+            Write-Host "Stripped: $file"
+          } else {
+            # Not present in artifact — this is normal (file was never included)
+            Write-Host "Not present (OK): $file"
           }
-          Write-Host "Deleted: $fullPath"
         }

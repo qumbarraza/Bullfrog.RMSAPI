@@ -10,6 +10,9 @@ on:
     branches:
       - master
 
+permissions:
+  contents: read
+
 jobs:
   validate-and-build:
     runs-on: [self-hosted, build]
@@ -55,10 +58,17 @@ jobs:
       - name: Strip env-managed DLLs
         shell: pwsh
         run: |
-          $dll = "publish_output/ThirdParty.Dummy.dll"
-          [System.IO.File]::Delete($dll)
+          # Strip ThirdParty.Dummy.dll — it lives on the VM, not in the artifact.
+          # Warn-only if not present (some configs may not produce it).
+          $dll = Join-Path "publish_output" "ThirdParty.Dummy.dll"
           if ([System.IO.File]::Exists($dll)) {
-            throw "Failed to delete $dll — file still present after deletion"
+            [System.IO.File]::Delete($dll)
+            if ([System.IO.File]::Exists($dll)) {
+              throw "Failed to strip ThirdParty.Dummy.dll — file still present after deletion."
+            }
+            Write-Host "Stripped ThirdParty.Dummy.dll"
+          } else {
+            Write-Host "ThirdParty.Dummy.dll not found in publish output — nothing to strip."
           }
 
       - name: Write version.json
@@ -70,8 +80,24 @@ jobs:
             "bullfrog-sha"= "${{ steps.link-deps.outputs.bullfrog-sha }}"
             "run-id"      = "${{ github.run_id }}"
             branch        = "${{ github.ref_name }}"
+            "built-at"    = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
           }
           $version | ConvertTo-Json | Set-Content publish_output/version.json
+          Write-Host "version.json written:"
+          Get-Content publish_output/version.json
+
+      - name: Verify publish output
+        shell: pwsh
+        run: |
+          # Guard: ensure key files exist before uploading
+          $required = @('version.json', 'Bullfrog.RMSAPI.dll', 'Bullfrog.RMSAPI.runtimeconfig.json')
+          $missing  = $required | Where-Object { -not (Test-Path "publish_output/$_") }
+          if ($missing) {
+            Write-Error "Publish output is missing required files: $($missing -join ', ')"
+            exit 1
+          }
+          $count = (Get-ChildItem publish_output -Recurse -File).Count
+          Write-Host "Publish output OK — $count files"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -79,3 +105,24 @@ jobs:
           name: ci-publish-${{ github.sha }}
           path: publish_output/
           retention-days: 3
+
+      - name: Write CI summary
+        if: always()
+        shell: pwsh
+        run: |
+          $sha       = '${{ github.sha }}'.Substring(0,7)
+          $branch    = '${{ github.ref_name }}'
+          $runUrl    = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          $bSha      = '${{ steps.link-deps.outputs.bullfrog-sha }}'
+          $bSha7     = if ($bSha.Length -ge 7) { $bSha.Substring(0,7) } else { $bSha }
+
+          @"
+          ## CI Build — $branch @ ``$sha``
+          | Field | Value |
+          |-------|-------|
+          | Branch | $branch |
+          | RMSAPI SHA | ``$sha`` |
+          | Bullfrog SHA | ``$bSha7`` |
+          | Artifact | ``ci-publish-${{ github.sha }}`` (3-day retention) |
+          | Run | $runUrl |
+          "@ >> $env:GITHUB_STEP_SUMMARY

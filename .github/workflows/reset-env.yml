@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: Environment
+        description: Environment to reset
         required: true
         type: choice
         options:
@@ -14,6 +14,9 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   resolve:
     runs-on: [self-hosted, build]
@@ -22,17 +25,38 @@ jobs:
     outputs:
       latest-version: ${{ steps.resolve.outputs.latest-version }}
     steps:
-      - id: resolve
+      - name: Resolve latest release version
+        id: resolve
         shell: pwsh
         run: |
+          # Guard: prod requires confirmation
           if ('${{ inputs.environment }}' -like '*prod*') {
             if ('${{ inputs.confirmation }}' -ne 'RESET-PROD') {
-              Write-Error "Confirmation required for prod environment. Type RESET-PROD to confirm."
+              Write-Error "Prod reset blocked — type RESET-PROD in the confirmation field."
               exit 1
             }
           }
-          $tag = Invoke-Expression "gh api repos/qumbarraza/Bullfrog.RMSAPI/releases/latest --jq .tag_name"
-          $ver = $tag -replace "^v",""
+
+          # Guard: verify at least one release exists
+          $releases = gh api repos/qumbarraza/Bullfrog.RMSAPI/releases --jq 'length' 2>&1
+          if ($LASTEXITCODE -ne 0 -or [int]$releases -eq 0) {
+            Write-Error "No GitHub Releases found for this repo. Run release.yml on master first."
+            exit 1
+          }
+
+          $tag = gh api repos/qumbarraza/Bullfrog.RMSAPI/releases/latest --jq '.tag_name'
+          if (-not $tag) {
+            Write-Error "Could not resolve latest release tag."
+            exit 1
+          }
+
+          $ver = $tag -replace '^v', ''
+          if ($ver -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Latest release tag '$tag' does not match expected format vMAJOR.MINOR.PATCH."
+            exit 1
+          }
+
+          Write-Host "Latest release: $tag (version $ver)"
           echo "latest-version=$ver" >> $env:GITHUB_OUTPUT
 
   deploy:

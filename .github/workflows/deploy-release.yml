@@ -50,7 +50,10 @@ on:
         default: false
     secrets:
       BULLFROG_REPO_TOKEN:
-        required: true
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -64,16 +67,23 @@ jobs:
         run: |
           $version = '${{ inputs.version }}'.Trim()
 
-          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
-            Write-Error "Invalid version format '$version'. Expected format: MAJOR.MINOR.PATCH (e.g. 1.0.42)"
+          # Guard: version must be present
+          if (-not $version) {
+            Write-Error "Version input is empty. Provide a version like 1.0.42."
             exit 1
           }
 
-          $env = '${{ inputs.environment }}'
-          if ($env -eq 'vm-prod' -and '${{ github.event_name }}' -eq 'workflow_dispatch') {
-            $confirmation = '${{ inputs.confirmation }}'
-            if ($confirmation -ne 'DEPLOY-TO-PROD') {
-              Write-Error "Production deployment requires confirmation. Please type DEPLOY-TO-PROD in the confirmation field."
+          # Guard: must match semver MAJOR.MINOR.PATCH
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "Invalid version format '$version'. Expected MAJOR.MINOR.PATCH (e.g. 1.0.42)."
+            exit 1
+          }
+
+          # Guard: prod requires explicit confirmation
+          $environment = '${{ inputs.environment }}'
+          if ($environment -like '*prod*' -and '${{ github.event_name }}' -eq 'workflow_dispatch') {
+            if ('${{ inputs.confirmation }}' -ne 'DEPLOY-TO-PROD') {
+              Write-Error "Production deploy blocked — type DEPLOY-TO-PROD in the confirmation field."
               exit 1
             }
           }
@@ -97,131 +107,199 @@ jobs:
           sparse-checkout-cone-mode: false
           path: .
 
+      # ── Pre-flight ──────────────────────────────────────────────────────────
+
+      - name: Verify environment variables
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (-not '${{ vars.APP_POOL }}')  { $missing += 'APP_POOL' }
+          if (-not '${{ vars.SITE_PATH }}') { $missing += 'SITE_PATH' }
+          if ($missing) {
+            Write-Error "Missing required environment variables: $($missing -join ', '). Configure them under Settings > Environments > ${{ inputs.environment }}."
+            exit 1
+          }
+          Write-Host "Environment variables OK — APP_POOL=${{ vars.APP_POOL }}, SITE_PATH=${{ vars.SITE_PATH }}"
+
+      - name: Ensure SITE_PATH exists
+        shell: pwsh
+        run: |
+          $path = '${{ vars.SITE_PATH }}'
+          if (-not (Test-Path $path)) {
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+            Write-Host "Created SITE_PATH: $path"
+          } else {
+            Write-Host "SITE_PATH exists: $path"
+          }
+
       - name: Download release artifact
         shell: pwsh
         run: |
           $version = '${{ needs.validate.outputs.version }}'
-          gh release download "v$version" --pattern "*.zip" --dir release-download/ --repo qumbarraza/Bullfrog.RMSAPI
-
-      - name: Extract release artifact
-        shell: pwsh
-        run: |
-          Expand-Archive release-download/*.zip -DestinationPath deploy-staging/ -Force
-
-      - name: Verify artifact integrity
-        shell: pwsh
-        run: |
-          if (-not (Test-Path 'deploy-staging/version.json')) {
-            throw "Artifact missing version.json"
+          # Guard: verify the release exists before trying to download
+          $release = gh api repos/qumbarraza/Bullfrog.RMSAPI/releases/tags/v$version 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Release v$version not found. Verify the version exists at github.com/qumbarraza/Bullfrog.RMSAPI/releases."
+            exit 1
           }
+          New-Item -ItemType Directory -Force -Path release-download | Out-Null
+          gh release download "v$version" --pattern "*.zip" --dir release-download/ --repo qumbarraza/Bullfrog.RMSAPI
+          $global:LASTEXITCODE = 0
+
+      - name: Extract and verify artifact
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem release-download/*.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $zip) {
+            Write-Error "No zip file found in release-download/. The release may have no asset attached."
+            exit 1
+          }
+          Expand-Archive $zip.FullName -DestinationPath deploy-staging/ -Force
+
+          # Guard: version.json must be present and valid
+          $vFile = 'deploy-staging/version.json'
+          if (-not (Test-Path $vFile)) {
+            Write-Error "Artifact is missing version.json — artifact may be corrupt or built by an older pipeline."
+            exit 1
+          }
+          try {
+            $vInfo = Get-Content $vFile | ConvertFrom-Json
+            Write-Host "Artifact verified — version=$($vInfo.version) rmsapi-sha=$($vInfo.'rmsapi-sha') bullfrog-sha=$($vInfo.'bullfrog-sha')"
+          } catch {
+            Write-Error "version.json exists but could not be parsed as JSON: $_"
+            exit 1
+          }
+
+      # ── Backup (stage/prod only) ─────────────────────────────────────────────
 
       - name: Backup current deployment
         if: (contains(inputs.environment, 'stage') || contains(inputs.environment, 'prod')) && !inputs.skip-backup
         shell: pwsh
         run: |
-          $sitePath = '${{ vars.SITE_PATH }}'
+          $sitePath   = '${{ vars.SITE_PATH }}'
           $backupRoot = '${{ vars.BACKUP_ROOT }}'
-          $version = '${{ needs.validate.outputs.version }}'
-          $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-          $backupDir = Join-Path $backupRoot "backup-$version-$timestamp"
+          $version    = '${{ needs.validate.outputs.version }}'
 
-          New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
-          robocopy $sitePath $backupDir /E /NFL /NDL /NJH /NJS | Out-Null
+          if (-not $backupRoot) {
+            Write-Warning "BACKUP_ROOT not set for ${{ inputs.environment }} — skipping backup."
+          } else {
+            $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $backupDir = Join-Path $backupRoot "backup-$version-$timestamp"
+            New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+            robocopy $sitePath $backupDir /E /NFL /NDL /NJH /NJS | Out-Null
 
-          $retentionCount = [int]('${{ vars.BACKUP_RETENTION }}' -replace '^\s*$', '10')
-          $allBackups = Get-ChildItem -Path $backupRoot -Directory |
-            Where-Object { $_.Name -like 'backup-*' } |
-            Sort-Object CreationTime -Descending
-
-          if ($allBackups.Count -gt $retentionCount) {
-            $toDelete = $allBackups | Select-Object -Skip $retentionCount
-            foreach ($dir in $toDelete) {
-              Remove-Item -Recurse -Force $dir.FullName
-              Write-Host "Pruned old backup: $($dir.Name)"
+            # Prune old backups
+            $retentionCount = [int](('${{ vars.BACKUP_RETENTION }}' -replace '^\s*$', '10'))
+            $allBackups = Get-ChildItem -Path $backupRoot -Directory |
+              Where-Object { $_.Name -like 'backup-*' } |
+              Sort-Object CreationTime -Descending
+            if ($allBackups.Count -gt $retentionCount) {
+              $allBackups | Select-Object -Skip $retentionCount | ForEach-Object {
+                Remove-Item -Recurse -Force $_.FullName
+                Write-Host "Pruned old backup: $($_.Name)"
+              }
             }
+            Write-Host "Backup created: $backupDir"
           }
+
+      # ── Strip VM-owned files ─────────────────────────────────────────────────
 
       - name: Strip environment-managed config
         uses: ./.github/actions/strip-env-config
         with:
           deploy-path: deploy-staging/
 
+      # ── IIS cycle ──────────────────────────────────────────────────────────
+      # IMPORTANT: app pool is always restarted in the 'finally' step below,
+      # even if robocopy fails, so the site is never left down.
+
       - name: Stop application pool
+        id: stop-pool
         shell: pwsh
         run: |
           $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
+          if (-not (Test-Path $appcmd)) {
+            Write-Error "appcmd.exe not found at $appcmd — is IIS installed?"
+            exit 1
+          }
           $state = & $appcmd list apppool /apppool.name:'${{ vars.APP_POOL }}'
+          if (-not $state) {
+            Write-Error "App pool '${{ vars.APP_POOL }}' not found. Check APP_POOL variable."
+            exit 1
+          }
           if ($state -match 'state:Started') {
             & $appcmd stop apppool /apppool.name:'${{ vars.APP_POOL }}'
-            if ($LASTEXITCODE -ne 0) { throw "appcmd stop apppool failed with exit code $LASTEXITCODE" }
-            Write-Host "App pool '${{ vars.APP_POOL }}' stopped — waiting for worker process to exit..."
+            if ($LASTEXITCODE -ne 0) { throw "appcmd stop failed (exit $LASTEXITCODE)" }
+            Write-Host "App pool stopped — waiting for w3wp.exe to release file locks..."
           } else {
-            Write-Host "App pool '${{ vars.APP_POOL }}' was already stopped"
+            Write-Host "App pool was already stopped"
           }
 
-          # Wait for w3wp.exe to fully release file locks (up to 30s)
-          $maxWait = 30
-          $waited  = 0
-          while ($waited -lt $maxWait) {
-            $workers = Get-Process -Name w3wp -ErrorAction SilentlyContinue
-            if (-not $workers) { Write-Host "w3wp.exe exited after ${waited}s"; break }
-            Start-Sleep -Seconds 2
-            $waited += 2
+          # Wait up to 30s for worker process to fully exit
+          $waited = 0
+          while ($waited -lt 30) {
+            if (-not (Get-Process w3wp -ErrorAction SilentlyContinue)) {
+              Write-Host "w3wp.exe exited after ${waited}s"; break
+            }
+            Start-Sleep -Seconds 2; $waited += 2
           }
-          if ($waited -ge $maxWait) { Write-Host "Warning: w3wp.exe still running after ${maxWait}s, proceeding anyway" }
+          if ($waited -ge 30) { Write-Host "Warning: w3wp.exe still alive after 30s, proceeding" }
           $global:LASTEXITCODE = 0
 
       - name: Deploy files via robocopy
+        id: robocopy
         shell: pwsh
         run: |
           $src = 'deploy-staging\'
           $dst = '${{ vars.SITE_PATH }}'
-          robocopy $src $dst /E /NFL /NDL /NJH /NJS
+          robocopy $src $dst /E /IS /IT /NFL /NDL /NJH /NJS
           $rc = $LASTEXITCODE
-          if ($rc -ge 8) {
-            throw "robocopy failed with exit code $rc"
-          }
-          Write-Host "robocopy completed with exit code $rc (success)"
+          if ($rc -ge 8) { throw "robocopy failed with exit code $rc" }
+          Write-Host "robocopy exit code $rc (success)"
           $global:LASTEXITCODE = 0
 
+      # Always restart the pool — even if robocopy failed — so site is not left down
       - name: Start application pool
+        if: always() && steps.stop-pool.conclusion == 'success'
         shell: pwsh
         run: |
           $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
           & $appcmd start apppool /apppool.name:'${{ vars.APP_POOL }}'
-          if ($LASTEXITCODE -ne 0) { throw "appcmd start apppool failed with exit code $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "appcmd start failed (exit $LASTEXITCODE)" }
           Write-Host "App pool '${{ vars.APP_POOL }}' started"
+          $global:LASTEXITCODE = 0
+
+      # ── Post-deploy verification ─────────────────────────────────────────────
 
       - name: Health check
         if: vars.HEALTH_CHECK_URL != ''
         shell: pwsh
         run: |
           $url = '${{ vars.HEALTH_CHECK_URL }}'
-          $maxAttempts = 5
-          $sleepSeconds = 6
           $success = $false
-          for ($i = 1; $i -le $maxAttempts; $i++) {
+          for ($i = 1; $i -le 5; $i++) {
             try {
-              $response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
-              if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
-                Write-Host "Health check passed on attempt $i (HTTP $($response.StatusCode))"
-                $success = $true
-                break
+              $res = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+              if ($res.StatusCode -ge 200 -and $res.StatusCode -lt 400) {
+                Write-Host "Health check passed on attempt $i (HTTP $($res.StatusCode))"
+                $success = $true; break
               }
-              Write-Host "Health check attempt $i returned HTTP $($response.StatusCode)"
+              Write-Host "Attempt $i — HTTP $($res.StatusCode)"
             } catch {
-              Write-Host "Health check attempt $i failed: $_"
+              Write-Host "Attempt $i — $($_.Exception.Message)"
             }
-            if ($i -lt $maxAttempts) {
-              Start-Sleep -Seconds $sleepSeconds
-            }
+            if ($i -lt 5) { Start-Sleep -Seconds 6 }
           }
           if (-not $success) {
-            throw "Health check failed after $maxAttempts attempts at $url"
+            Write-Error "Health check failed after 5 attempts at $url — site may not be responding correctly."
+            exit 1
           }
+
+      # ── Record & report ──────────────────────────────────────────────────────
 
       - name: Record deployment
         id: record
+        if: steps.robocopy.conclusion == 'success'
         uses: ./.github/actions/record-deployment
         with:
           version: ${{ needs.validate.outputs.version }}
@@ -232,26 +310,49 @@ jobs:
           branch: ${{ github.ref_name }}
 
       - name: Write job summary
+        if: always()
         shell: pwsh
         run: |
-          $version  = '${{ needs.validate.outputs.version }}'
-          $env      = '${{ inputs.environment }}'
-          $action   = '${{ inputs.action-type }}'
-          $actor    = '${{ github.actor }}'
-          $sitePath = '${{ vars.SITE_PATH }}'
-          $publicUrl = '${{ vars.HEALTH_CHECK_URL }}'
+          $version    = '${{ needs.validate.outputs.version }}'
+          $env        = '${{ inputs.environment }}'
+          $action     = '${{ inputs.action-type }}'
+          $actor      = '${{ github.actor }}'
+          $sitePath   = '${{ vars.SITE_PATH }}'
+          $publicUrl  = '${{ vars.PUBLIC_URL }}'
+          $runUrl     = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+
+          # Read version.json from site for post-deploy confirmation
+          $deployedVersion = 'unknown'
+          $vFile = Join-Path '${{ vars.SITE_PATH }}' 'version.json'
+          if (Test-Path $vFile) {
+            try { $deployedVersion = (Get-Content $vFile | ConvertFrom-Json).version } catch {}
+          }
+
+          $robocopyOk = '${{ steps.robocopy.conclusion }}'   -eq 'success'
+          $poolOk     = '${{ steps.stop-pool.conclusion }}'  -ne 'failure'
+          $overallIcon = if ($robocopyOk) { ':white_check_mark:' } else { ':x:' }
 
           $summary = @"
-          ## Deployment Summary
+          ## $overallIcon Deployment Report — $action to $env
 
-          | Field      | Value        |
-          |------------|--------------|
-          | Environment | $env        |
-          | Version     | $version    |
-          | Action      | $action     |
-          | Actor       | $actor      |
-          | Site Path   | $sitePath   |
-          | Public URL  | $publicUrl  |
+          | Field              | Value |
+          |--------------------|-------|
+          | **Environment**    | $env |
+          | **Action**         | $action |
+          | **Requested ver.** | $version |
+          | **Deployed ver.**  | $deployedVersion |
+          | **Actor**          | $actor |
+          | **Site path**      | $sitePath |
+          | **Public URL**     | $publicUrl |
+          | **Run**            | $runUrl |
+
+          ### Step Results
+          | Step | Result |
+          |------|--------|
+          | Download & verify | ${{ steps.robocopy.conclusion != '' && 'done' || 'skipped' }} |
+          | Stop pool         | ${{ steps.stop-pool.conclusion }} |
+          | Robocopy          | ${{ steps.robocopy.conclusion }} |
+          | Start pool        | done |
           "@
 
           $summary >> $env:GITHUB_STEP_SUMMARY

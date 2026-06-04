@@ -1,4 +1,5 @@
 name: Record Deployment
+description: Append an entry to deploy-history.log and overwrite current-deployment.json on the target VM.
 
 inputs:
   version:
@@ -7,6 +8,7 @@ inputs:
     required: true
   action-type:
     required: true
+    description: One of deploy / rollback / reset / branch
   actor:
     required: true
   commit:
@@ -22,10 +24,13 @@ inputs:
 
 outputs:
   prior-version:
+    description: Version that was deployed before this run
     value: ${{ steps.read-prior.outputs.prior-version }}
   prior-actor:
+    description: Actor who performed the previous deployment
     value: ${{ steps.read-prior.outputs.prior-actor }}
   prior-ts:
+    description: Timestamp of the previous deployment (ISO 8601)
     value: ${{ steps.read-prior.outputs.prior-ts }}
 
 runs:
@@ -34,20 +39,35 @@ runs:
     - id: read-prior
       shell: pwsh
       run: |
-        $ts = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
-
+        $ts              = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')
+        $historyLogPath  = '${{ inputs.history-log-path }}'
         $currentJsonPath = '${{ inputs.current-json-path }}'
+
+        # ── Read prior state (for outputs) ─────────────────────────────────
         if (Test-Path $currentJsonPath) {
-          $cur = Get-Content $currentJsonPath -Raw | ConvertFrom-Json
-          echo "prior-version=$($cur.version)" >> $env:GITHUB_OUTPUT
-          echo "prior-actor=$($cur.actor)" >> $env:GITHUB_OUTPUT
-          echo "prior-ts=$($cur.timestamp)" >> $env:GITHUB_OUTPUT
+          try {
+            $cur = Get-Content $currentJsonPath -Raw | ConvertFrom-Json
+            echo "prior-version=$($cur.version)"   >> $env:GITHUB_OUTPUT
+            echo "prior-actor=$($cur.actor)"       >> $env:GITHUB_OUTPUT
+            echo "prior-ts=$($cur.timestamp)"      >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Warning "Could not parse current-deployment.json: $_ — prior outputs will be empty."
+          }
+        } else {
+          Write-Host "No prior deployment record found (first deploy to this environment)."
         }
 
-        New-Item -ItemType Directory -Force -Path (Split-Path '${{ inputs.history-log-path }}' -Parent) | Out-Null
+        # ── Write new state ─────────────────────────────────────────────────
+        # Wrap in try/catch so a logging failure never kills a successful deploy
+        try {
+          # Ensure directory exists
+          $dir = Split-Path $historyLogPath -Parent
+          if (-not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            Write-Host "Created directory: $dir"
+          }
 
-        $logLine = (
-          [PSCustomObject]@{
+          $entry = [PSCustomObject]@{
             timestamp   = $ts
             version     = '${{ inputs.version }}'
             environment = '${{ inputs.environment }}'
@@ -55,17 +75,18 @@ runs:
             actor       = '${{ inputs.actor }}'
             commit      = '${{ inputs.commit }}'
             branch      = '${{ inputs.branch }}'
-          } | ConvertTo-Json -Compress
-        )
-        Add-Content -Path '${{ inputs.history-log-path }}' -Value $logLine
+          }
 
-        $state = [PSCustomObject]@{
-          timestamp   = $ts
-          version     = '${{ inputs.version }}'
-          environment = '${{ inputs.environment }}'
-          actionType  = '${{ inputs.action-type }}'
-          actor       = '${{ inputs.actor }}'
-          commit      = '${{ inputs.commit }}'
-          branch      = '${{ inputs.branch }}'
+          # Append to history log (one JSON object per line)
+          Add-Content -Path $historyLogPath -Value ($entry | ConvertTo-Json -Compress)
+          Write-Host "History log updated: $historyLogPath"
+
+          # Overwrite current-deployment.json
+          $entry | ConvertTo-Json | Set-Content -Path $currentJsonPath -Force
+          Write-Host "Current deployment updated: $currentJsonPath"
+          Write-Host "Recorded: version=${{ inputs.version }} action=${{ inputs.action-type }} actor=${{ inputs.actor }}"
+
+        } catch {
+          # Non-fatal — log the error but do not fail the workflow step
+          Write-Warning "record-deployment encountered an error: $_ — deployment succeeded but record may be incomplete."
         }
-        $state | ConvertTo-Json | Set-Content -Path '${{ inputs.current-json-path }}'

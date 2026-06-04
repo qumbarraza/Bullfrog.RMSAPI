@@ -10,7 +10,7 @@ on:
         options:
           - vm-dev
       version:
-        description: Specific version or "previous" to auto-resolve
+        description: Specific version or "previous" to auto-resolve from history
         required: false
         default: previous
         type: string
@@ -19,79 +19,94 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   resolve:
     runs-on: [self-hosted, "${{ inputs.environment }}"]
     outputs:
       resolved-version: ${{ steps.resolve.outputs.resolved-version }}
     steps:
-      - id: resolve
-        name: Resolve rollback version
+      - name: Resolve rollback version
+        id: resolve
         shell: pwsh
         run: |
-          $environment = "${{ inputs.environment }}"
-          $version = "${{ inputs.version }}"
-          $confirmation = "${{ inputs.confirmation }}"
+          $environment  = '${{ inputs.environment }}'
+          $version      = '${{ inputs.version }}'.Trim()
+          $confirmation = '${{ inputs.confirmation }}'
 
-          if ($environment -match "prod" -and "${{ github.event_name }}" -eq "workflow_dispatch") {
-            if ($confirmation -ne "ROLLBACK-PROD") {
-              Write-Error "Confirmation required for prod rollback. Set confirmation input to ROLLBACK-PROD."
+          # Guard: prod requires confirmation
+          if ($environment -like '*prod*') {
+            if ($confirmation -ne 'ROLLBACK-PROD') {
+              Write-Error "Prod rollback blocked — type ROLLBACK-PROD in the confirmation field."
               exit 1
             }
           }
 
-          if ($version -ne "previous") {
+          # Explicit version provided
+          if ($version -ne 'previous') {
             if ($version -notmatch '^\d+\.\d+\.\d+$') {
-              Write-Error "Invalid version format '$version'. Must be a semver like 1.0.123."
+              Write-Error "Invalid version '$version'. Must be semver MAJOR.MINOR.PATCH (e.g. 1.0.5)."
               exit 1
             }
-            "resolved-version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            Write-Host "Resolved version (explicit): $version"
-          } else {
-            $deploymentJsonPath = "C:\RMSApplicationFiles\current-deployment.json"
-            $historyLogPath = "C:\RMSApplicationFiles\deploy-history.log"
-
-            if (-not (Test-Path $deploymentJsonPath)) {
-              Write-Error "current-deployment.json not found at $deploymentJsonPath"
-              exit 1
-            }
-            if (-not (Test-Path $historyLogPath)) {
-              Write-Error "deploy-history.log not found at $historyLogPath"
-              exit 1
-            }
-
-            $currentDeployment = Get-Content $deploymentJsonPath -Raw | ConvertFrom-Json
-            $currentVersion = $currentDeployment.version
-            Write-Host "Current deployed version: $currentVersion"
-
-            $historyLines = Get-Content $historyLogPath | Where-Object { $_.Trim() -ne "" }
-            $entries = @()
-            foreach ($line in $historyLines) {
-              try {
-                $entry = $line | ConvertFrom-Json
-                $entries += $entry
-              } catch {
-                Write-Warning "Skipping unparseable history line: $line"
-              }
-            }
-
-            $resolvedVersion = $null
-            for ($i = $entries.Count - 1; $i -ge 0; $i--) {
-              $entryVersion = $entries[$i].version
-              if ($entryVersion -match '^\d+\.\d+\.\d+$' -and $entryVersion -ne $currentVersion) {
-                $resolvedVersion = $entryVersion
-                break
-              }
-            }
-
-            if (-not $resolvedVersion) {
-              Write-Error "No valid prior release version found in history"
-              exit 1
-            }
-
-            "resolved-version=$resolvedVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            Write-Host "Resolved version (previous): $resolvedVersion"
+            Write-Host "Using explicit rollback target: $version"
+            echo "resolved-version=$version" >> $env:GITHUB_OUTPUT
+            exit 0
           }
+
+          # Auto-resolve "previous" from history
+          $jsonPath    = 'C:\RMSApplicationFiles\current-deployment.json'
+          $historyPath = 'C:\RMSApplicationFiles\deploy-history.log'
+
+          # Guard: deployment record must exist
+          if (-not (Test-Path $jsonPath)) {
+            Write-Error "No deployment record found at $jsonPath. Has this environment been deployed to yet?"
+            exit 1
+          }
+          if (-not (Test-Path $historyPath)) {
+            Write-Error "No deploy history found at $historyPath. Cannot determine prior version."
+            exit 1
+          }
+
+          $current = (Get-Content $jsonPath -Raw | ConvertFrom-Json).version
+          if (-not $current) {
+            Write-Error "current-deployment.json exists but has no 'version' field."
+            exit 1
+          }
+          Write-Host "Current deployed version: $current"
+
+          # Parse history — skip blank lines and unparseable entries
+          $entries = @()
+          Get-Content $historyPath | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
+            try   { $entries += ($_ | ConvertFrom-Json) }
+            catch { Write-Warning "Skipping unparseable history line: $_" }
+          }
+
+          # Guard: need at least 2 entries to find a prior version
+          if ($entries.Count -lt 2) {
+            Write-Error "Deploy history has $($entries.Count) entry/entries. Need at least 2 to roll back."
+            exit 1
+          }
+
+          # Walk backwards: find first semver-versioned entry that differs from current
+          # Branch deploys (format: 1.0.X-pr.*) are excluded as rollback targets
+          $resolved = $null
+          for ($i = $entries.Count - 1; $i -ge 0; $i--) {
+            $v = $entries[$i].version
+            if ($v -match '^\d+\.\d+\.\d+$' -and $v -ne $current) {
+              $resolved = $v
+              Write-Host "Found prior release version: $v (entry $i of $($entries.Count))"
+              break
+            }
+          }
+
+          if (-not $resolved) {
+            Write-Error "No valid prior release version found in history. Only branch builds or the current version appear in history — nothing to roll back to."
+            exit 1
+          }
+
+          echo "resolved-version=$resolved" >> $env:GITHUB_OUTPUT
 
   deploy:
     needs: resolve
