@@ -150,9 +150,15 @@ jobs:
         shell: pwsh
         run: |
           $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
-          & $appcmd stop apppool /apppool.name:'${{ vars.APP_POOL }}'
-          if ($LASTEXITCODE -ne 0) { throw "appcmd stop apppool failed with exit code $LASTEXITCODE" }
-          Write-Host "App pool '${{ vars.APP_POOL }}' stopped"
+          $state = & $appcmd list apppool /apppool.name:'${{ vars.APP_POOL }}' /processModel.userName /state
+          if ($state -match 'state:Started') {
+            & $appcmd stop apppool /apppool.name:'${{ vars.APP_POOL }}'
+            if ($LASTEXITCODE -ne 0) { throw "appcmd stop apppool failed with exit code $LASTEXITCODE" }
+            Write-Host "App pool '${{ vars.APP_POOL }}' stopped"
+          } else {
+            Write-Host "App pool '${{ vars.APP_POOL }}' was already stopped — skipping"
+          }
+          $global:LASTEXITCODE = 0
 
       - name: Deploy files via robocopy
         shell: pwsh
