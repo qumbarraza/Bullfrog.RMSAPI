@@ -1,5 +1,9 @@
 name: Deploy - Branch to Environment (Pre-Merge)
 
+permissions:
+  contents: read
+  pull-requests: write  # required for gh pr comment in notify-pr job
+
 on:
   workflow_dispatch:
     inputs:
@@ -280,16 +284,42 @@ jobs:
       - name: Comment on PR
         shell: pwsh
         run: |
-          $branch = '${{ inputs.branch }}'.Trim()
-          $pr = gh pr list --repo qumbarraza/Bullfrog.RMSAPI --head $branch --state open --json number --jq '.[0].number' 2>$null
-          if ($pr) {
-            $status  = '${{ needs.deploy.result }}'
-            $icon    = if ($status -eq 'success') { 'rocket' } else { 'x' }
-            $version = '${{ needs.resolve.outputs.version }}'
-            $sha7    = '${{ needs.resolve.outputs.sha }}'.Substring(0,7)
-            $body    = ":$icon`: Branch ``$branch`` @ ``$sha7`` deployed to **${{ inputs.environment }}``\n> Version: ``$version`` | Actor: @${{ github.actor }} | Status: $status"
-            gh pr comment $pr --repo qumbarraza/Bullfrog.RMSAPI --body $body
-            Write-Host "Commented on PR #$pr"
-          } else {
-            Write-Host "No open PR found for branch $branch"
+          # Prefer the sanitized branch-safe name from resolve; fall back to raw input
+          $branch = '${{ needs.resolve.outputs.branch-safe }}'.Trim()
+          if (-not $branch) { $branch = '${{ inputs.branch }}'.Trim() }
+          if (-not $branch) {
+            Write-Host "No branch name available — skipping PR comment"
+            exit 0
           }
+
+          # Look up open PR for this branch (head ref must match exactly)
+          $pr = gh pr list --repo qumbarraza/Bullfrog.RMSAPI --head $branch --state open --json number --jq '.[0].number' 2>$null
+          if (-not $pr) {
+            Write-Host "No open PR found for branch '$branch' — skipping comment"
+            exit 0
+          }
+
+          $status  = '${{ needs.deploy.result }}'
+          $icon    = if ($status -eq 'success') { 'rocket' } else { 'x' }
+          $version = '${{ needs.resolve.outputs.version }}'
+          $sha7    = '${{ needs.resolve.outputs.sha }}'.Substring(0, [Math]::Min(7, '${{ needs.resolve.outputs.sha }}'.Length))
+          $envName = '${{ inputs.environment }}'
+          $pubUrl  = '${{ vars.PUBLIC_URL }}'
+
+          $body = @"
+          :${icon}: Branch \`$branch\` @ \`$sha7\` deployed to **$envName**
+          | Field | Value |
+          |-------|-------|
+          | Version | \`$version\` |
+          | Actor | @${{ github.actor }} |
+          | Status | $status |
+          | URL | $pubUrl |
+          "@
+
+          gh pr comment $pr --repo qumbarraza/Bullfrog.RMSAPI --body $body
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "gh pr comment exited with code $LASTEXITCODE — comment may not have been posted."
+          } else {
+            Write-Host "PR #$pr commented successfully"
+          }
+          $global:LASTEXITCODE = 0
