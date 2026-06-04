@@ -165,6 +165,7 @@ jobs:
             throw "robocopy failed with exit code $rc"
           }
           Write-Host "robocopy completed with exit code $rc (success)"
+          $global:LASTEXITCODE = 0
 
       - name: Start application pool
         shell: pwsh
