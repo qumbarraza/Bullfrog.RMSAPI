@@ -22,10 +22,10 @@ runs:
         repository: qumbarraza/Bullfrog
         token: ${{ inputs.bullfrog-token }}
         ref: ${{ inputs.bullfrog-ref }}
-        path: bullfrog
+        path: Bullfrog.RMSAPI/Bullfrog
 
     - id: get-sha
       shell: pwsh
       run: |
-        $sha = git -C bullfrog rev-parse HEAD
+        $sha = git -C Bullfrog.RMSAPI/Bullfrog rev-parse HEAD
         echo "bullfrog-sha=$sha" >> $env:GITHUB_OUTPUT
