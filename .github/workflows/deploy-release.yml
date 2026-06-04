@@ -149,8 +149,9 @@ jobs:
       - name: Stop application pool
         shell: pwsh
         run: |
-          Import-Module WebAdministration -SkipEditionCheck
-          Stop-WebAppPool -Name '${{ vars.APP_POOL }}'
+          $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
+          & $appcmd stop apppool /apppool.name:'${{ vars.APP_POOL }}'
+          if ($LASTEXITCODE -ne 0) { throw "appcmd stop apppool failed with exit code $LASTEXITCODE" }
           Write-Host "App pool '${{ vars.APP_POOL }}' stopped"
 
       - name: Deploy files via robocopy
@@ -168,8 +169,9 @@ jobs:
       - name: Start application pool
         shell: pwsh
         run: |
-          Import-Module WebAdministration -SkipEditionCheck
-          Start-WebAppPool -Name '${{ vars.APP_POOL }}'
+          $appcmd = "$env:SystemRoot\system32\inetsrv\appcmd.exe"
+          & $appcmd start apppool /apppool.name:'${{ vars.APP_POOL }}'
+          if ($LASTEXITCODE -ne 0) { throw "appcmd start apppool failed with exit code $LASTEXITCODE" }
           Write-Host "App pool '${{ vars.APP_POOL }}' started"
 
       - name: Health check
