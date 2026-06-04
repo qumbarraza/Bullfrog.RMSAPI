@@ -1,0 +1,70 @@
+name: Hygiene - Stale Branch Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      stale-days:
+        description: 'Number of days before a branch is considered stale'
+        required: false
+        default: '30'
+        type: string
+      open-issue:
+        description: 'Open a GitHub issue if stale branches are found'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 9 * * MON'
+
+jobs:
+  report:
+    runs-on: [self-hosted, build]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Stale Branch Report
+        shell: pwsh
+        run: |
+          $staleDays = if ('${{ inputs.stale-days }}' -ne '') { [int]'${{ inputs.stale-days }}' } else { 30 }
+
+          $branches = gh api repos/qumbarraza/Bullfrog.RMSAPI/branches --paginate | ConvertFrom-Json
+
+          $protected = '^(master|main|temp-main|dev|test|stage|live|HEAD)$'
+
+          $filtered = $branches | Where-Object { $_.name -notmatch $protected }
+
+          $staleBranches = @()
+          foreach ($branch in $filtered) {
+            $branchDetail = gh api repos/qumbarraza/Bullfrog.RMSAPI/branches/$($branch.name) | ConvertFrom-Json
+            $date = $branchDetail.commit.commit.author.date
+            $author = $branchDetail.commit.commit.author.name
+            $daysSince = [int]((Get-Date) - (Get-Date $date)).TotalDays
+            if ($daysSince -ge $staleDays) {
+              $staleBranches += [PSCustomObject]@{
+                Name         = $branch.name
+                LastCommit   = $date
+                Author       = $author
+                DaysInactive = $daysSince
+              }
+            }
+          }
+
+          $summary = "## Stale Branch Report`n`n"
+          if ($staleBranches.Count -eq 0) {
+            $summary += "No stale branches found (threshold: $staleDays days).`n"
+          } else {
+            $summary += "Branches inactive for **$staleDays or more days** as of $(Get-Date -Format 'yyyy-MM-dd'):`n`n"
+            $summary += "| Name | Last Commit Date | Author | Days Inactive |`n"
+            $summary += "|------|-----------------|--------|---------------|`n"
+            foreach ($b in $staleBranches) {
+              $summary += "| $($b.Name) | $($b.LastCommit) | $($b.Author) | $($b.DaysInactive) |`n"
+            }
+            $summary += "`n"
+          }
+          $summary += "> **Report only — no branches auto-deleted (pilot mode)**`n"
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          if ('${{ inputs.open-issue }}' -eq 'true' -and $staleBranches.Count -gt 0) {
+            gh issue create --title "Stale branches" --body $summary
+          }

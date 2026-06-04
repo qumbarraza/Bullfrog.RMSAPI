@@ -1,0 +1,104 @@
+name: Rollback - Revert Environment to Prior Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - vm-dev
+      version:
+        description: Specific version or "previous" to auto-resolve
+        required: false
+        default: previous
+        type: string
+      confirmation:
+        description: For prod type ROLLBACK-PROD
+        required: false
+        type: string
+
+jobs:
+  resolve:
+    runs-on: [self-hosted, "${{ inputs.environment }}"]
+    outputs:
+      resolved-version: ${{ steps.resolve.outputs.resolved-version }}
+    steps:
+      - id: resolve
+        name: Resolve rollback version
+        shell: pwsh
+        run: |
+          $environment = "${{ inputs.environment }}"
+          $version = "${{ inputs.version }}"
+          $confirmation = "${{ inputs.confirmation }}"
+
+          if ($environment -match "prod" -and "${{ github.event_name }}" -eq "workflow_dispatch") {
+            if ($confirmation -ne "ROLLBACK-PROD") {
+              Write-Error "Confirmation required for prod rollback. Set confirmation input to ROLLBACK-PROD."
+              exit 1
+            }
+          }
+
+          if ($version -ne "previous") {
+            if ($version -notmatch '^\d+\.\d+\.\d+$') {
+              Write-Error "Invalid version format '$version'. Must be a semver like 1.0.123."
+              exit 1
+            }
+            "resolved-version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "Resolved version (explicit): $version"
+          } else {
+            $deploymentJsonPath = "C:\RMSApplicationFiles\current-deployment.json"
+            $historyLogPath = "C:\RMSApplicationFiles\deploy-history.log"
+
+            if (-not (Test-Path $deploymentJsonPath)) {
+              Write-Error "current-deployment.json not found at $deploymentJsonPath"
+              exit 1
+            }
+            if (-not (Test-Path $historyLogPath)) {
+              Write-Error "deploy-history.log not found at $historyLogPath"
+              exit 1
+            }
+
+            $currentDeployment = Get-Content $deploymentJsonPath -Raw | ConvertFrom-Json
+            $currentVersion = $currentDeployment.version
+            Write-Host "Current deployed version: $currentVersion"
+
+            $historyLines = Get-Content $historyLogPath | Where-Object { $_.Trim() -ne "" }
+            $entries = @()
+            foreach ($line in $historyLines) {
+              try {
+                $entry = $line | ConvertFrom-Json
+                $entries += $entry
+              } catch {
+                Write-Warning "Skipping unparseable history line: $line"
+              }
+            }
+
+            $resolvedVersion = $null
+            for ($i = $entries.Count - 1; $i -ge 0; $i--) {
+              $entryVersion = $entries[$i].version
+              if ($entryVersion -match '^\d+\.\d+\.\d+$' -and $entryVersion -ne $currentVersion) {
+                $resolvedVersion = $entryVersion
+                break
+              }
+            }
+
+            if (-not $resolvedVersion) {
+              Write-Error "No valid prior release version found in history"
+              exit 1
+            }
+
+            "resolved-version=$resolvedVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "Resolved version (previous): $resolvedVersion"
+          }
+
+  deploy:
+    needs: resolve
+    uses: ./.github/workflows/deploy-release.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ needs.resolve.outputs.resolved-version }}
+      action-type: rollback
+      skip-backup: true
+    secrets: inherit

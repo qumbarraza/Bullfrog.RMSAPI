@@ -1,0 +1,31 @@
+name: Link Shared Dependencies
+description: Checks out Bullfrog repo and captures its SHA
+
+inputs:
+  bullfrog-token:
+    required: true
+    description: PAT for Bullfrog repo
+  bullfrog-ref:
+    required: false
+    default: master
+
+outputs:
+  bullfrog-sha:
+    description: The resolved commit SHA
+    value: ${{ steps.get-sha.outputs.bullfrog-sha }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: qumbarraza/Bullfrog
+        token: ${{ inputs.bullfrog-token }}
+        ref: ${{ inputs.bullfrog-ref }}
+        path: bullfrog
+
+    - id: get-sha
+      shell: pwsh
+      run: |
+        $sha = git -C bullfrog rev-parse HEAD
+        echo "bullfrog-sha=$sha" >> $env:GITHUB_OUTPUT

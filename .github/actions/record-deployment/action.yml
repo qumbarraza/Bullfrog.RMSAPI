@@ -1,0 +1,71 @@
+name: Record Deployment
+
+inputs:
+  version:
+    required: true
+  environment:
+    required: true
+  action-type:
+    required: true
+  actor:
+    required: true
+  commit:
+    required: true
+  branch:
+    required: true
+  history-log-path:
+    required: false
+    default: C:\RMSApplicationFiles\deploy-history.log
+  current-json-path:
+    required: false
+    default: C:\RMSApplicationFiles\current-deployment.json
+
+outputs:
+  prior-version:
+    value: ${{ steps.read-prior.outputs.prior-version }}
+  prior-actor:
+    value: ${{ steps.read-prior.outputs.prior-actor }}
+  prior-ts:
+    value: ${{ steps.read-prior.outputs.prior-ts }}
+
+runs:
+  using: composite
+  steps:
+    - id: read-prior
+      shell: pwsh
+      run: |
+        $ts = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+
+        $currentJsonPath = '${{ inputs.current-json-path }}'
+        if (Test-Path $currentJsonPath) {
+          $cur = Get-Content $currentJsonPath -Raw | ConvertFrom-Json
+          echo "prior-version=$($cur.version)" >> $env:GITHUB_OUTPUT
+          echo "prior-actor=$($cur.actor)" >> $env:GITHUB_OUTPUT
+          echo "prior-ts=$($cur.timestamp)" >> $env:GITHUB_OUTPUT
+        }
+
+        New-Item -ItemType Directory -Force -Path (Split-Path '${{ inputs.history-log-path }}' -Parent) | Out-Null
+
+        $logLine = (
+          [PSCustomObject]@{
+            timestamp   = $ts
+            version     = '${{ inputs.version }}'
+            environment = '${{ inputs.environment }}'
+            actionType  = '${{ inputs.action-type }}'
+            actor       = '${{ inputs.actor }}'
+            commit      = '${{ inputs.commit }}'
+            branch      = '${{ inputs.branch }}'
+          } | ConvertTo-Json -Compress
+        )
+        Add-Content -Path '${{ inputs.history-log-path }}' -Value $logLine
+
+        $state = [PSCustomObject]@{
+          timestamp   = $ts
+          version     = '${{ inputs.version }}'
+          environment = '${{ inputs.environment }}'
+          actionType  = '${{ inputs.action-type }}'
+          actor       = '${{ inputs.actor }}'
+          commit      = '${{ inputs.commit }}'
+          branch      = '${{ inputs.branch }}'
+        }
+        $state | ConvertTo-Json | Set-Content -Path '${{ inputs.current-json-path }}'

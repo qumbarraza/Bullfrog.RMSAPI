@@ -1,0 +1,79 @@
+name: CI - Branch Validate and Cache Artifact
+
+on:
+  push:
+    branches:
+      - feature/**
+      - bugfix/**
+      - hotfix/**
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  validate-and-build:
+    runs-on: [self-hosted, build]
+    steps:
+      - name: Checkout .github
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          path: Bullfrog.RMSAPI
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Link shared deps
+        id: link-deps
+        uses: ./.github/actions/link-shared-deps
+        with:
+          bullfrog-token: ${{ secrets.BULLFROG_REPO_TOKEN }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: dotnet restore
+        run: dotnet restore Bullfrog.RMSAPI/Bullfrog.RMSAPI.sln
+
+      - name: dotnet build
+        run: dotnet build Bullfrog.RMSAPI/Bullfrog.RMSAPI.sln -c Release --no-restore
+
+      - name: dotnet test
+        run: dotnet test Bullfrog.RMSAPI/Bullfrog.RMSAPI.sln --no-build -c Release
+        continue-on-error: true # remove when tests are added
+
+      - name: dotnet publish
+        run: dotnet publish Bullfrog.RMSAPI/Bullfrog.RMSAPI/Bullfrog.RMSAPI.csproj -c Release --no-build -o publish_output
+
+      - name: Strip env-managed DLLs
+        shell: pwsh
+        run: |
+          $dll = "publish_output/ThirdParty.Dummy.dll"
+          [System.IO.File]::Delete($dll)
+          if ([System.IO.File]::Exists($dll)) {
+            throw "Failed to delete $dll — file still present after deletion"
+          }
+
+      - name: Write version.json
+        shell: pwsh
+        run: |
+          $version = @{
+            version       = "ci-${{ github.sha }}"
+            "rmsapi-sha"  = "${{ github.sha }}"
+            "bullfrog-sha"= "${{ steps.link-deps.outputs.bullfrog-sha }}"
+            "run-id"      = "${{ github.run_id }}"
+            branch        = "${{ github.ref_name }}"
+          }
+          $version | ConvertTo-Json | Set-Content publish_output/version.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-publish-${{ github.sha }}
+          path: publish_output/
+          retention-days: 3

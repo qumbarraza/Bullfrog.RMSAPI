@@ -1,0 +1,32 @@
+name: Strip Environment-Managed Config
+
+inputs:
+  deploy-path:
+    required: true
+    description: Path to the deployment directory
+  extra-files:
+    required: false
+    default: ''
+    description: CSV of additional files to strip
+
+runs:
+  using: composite
+  steps:
+    - name: Strip environment-managed config files
+      shell: pwsh
+      run: |
+        $files = @('appsettings.json')
+        if ('${{ inputs.extra-files }}' -ne '') {
+          '${{ inputs.extra-files }}'.Split(',') | ForEach-Object {
+            $trimmed = $_.Trim()
+            if ($trimmed -ne '') { $files += $trimmed }
+          }
+        }
+        foreach ($file in $files) {
+          $fullPath = Join-Path '${{ inputs.deploy-path }}' $file
+          [System.IO.File]::Delete($fullPath)
+          if ([System.IO.File]::Exists($fullPath)) {
+            throw "Failed to delete $fullPath"
+          }
+          Write-Host "Deleted: $fullPath"
+        }

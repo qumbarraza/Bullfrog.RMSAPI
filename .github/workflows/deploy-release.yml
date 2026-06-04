@@ -1,0 +1,233 @@
+name: Deploy - Release to Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - vm-dev
+      version:
+        description: Version to deploy (e.g. 1.0.42)
+        required: true
+        type: string
+      action-type:
+        description: Action to perform
+        required: true
+        type: choice
+        default: deploy
+        options:
+          - deploy
+          - rollback
+          - reset
+      skip-backup:
+        description: Skip backup step
+        required: false
+        type: boolean
+        default: false
+      confirmation:
+        description: For prod type DEPLOY-TO-PROD
+        required: false
+        type: string
+
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      action-type:
+        required: false
+        type: string
+        default: deploy
+      skip-backup:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      BULLFROG_REPO_TOKEN:
+        required: true
+
+jobs:
+  validate:
+    runs-on: [self-hosted, build]
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Validate inputs
+        id: check
+        shell: pwsh
+        run: |
+          $version = '${{ inputs.version }}'.Trim()
+
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            Write-Error "Invalid version format '$version'. Expected format: MAJOR.MINOR.PATCH (e.g. 1.0.42)"
+            exit 1
+          }
+
+          $env = '${{ inputs.environment }}'
+          if ($env -eq 'vm-prod' -and '${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $confirmation = '${{ inputs.confirmation }}'
+            if ($confirmation -ne 'DEPLOY-TO-PROD') {
+              Write-Error "Production deployment requires confirmation. Please type DEPLOY-TO-PROD in the confirmation field."
+              exit 1
+            }
+          }
+
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+
+  deploy:
+    needs: validate
+    runs-on: [self-hosted, "${{ inputs.environment }}"]
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Sparse checkout .github
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+          path: .
+
+      - name: Download release artifact
+        shell: pwsh
+        run: |
+          $version = '${{ needs.validate.outputs.version }}'
+          gh release download "v$version" --pattern "*.zip" --dir release-download/ --repo qumbarraza/Bullfrog.RMSAPI
+
+      - name: Extract release artifact
+        shell: pwsh
+        run: |
+          Expand-Archive release-download/*.zip -DestinationPath deploy-staging/ -Force
+
+      - name: Verify artifact integrity
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'deploy-staging/version.json')) {
+            throw "Artifact missing version.json"
+          }
+
+      - name: Backup current deployment
+        if: (contains(inputs.environment, 'stage') || contains(inputs.environment, 'prod')) && !inputs.skip-backup
+        shell: pwsh
+        run: |
+          $sitePath = '${{ vars.SITE_PATH }}'
+          $backupRoot = '${{ vars.BACKUP_ROOT }}'
+          $version = '${{ needs.validate.outputs.version }}'
+          $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+          $backupDir = Join-Path $backupRoot "backup-$version-$timestamp"
+
+          New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+          robocopy $sitePath $backupDir /E /NFL /NDL /NJH /NJS | Out-Null
+
+          $retentionCount = [int]('${{ vars.BACKUP_RETENTION }}' -replace '^\s*$', '10')
+          $allBackups = Get-ChildItem -Path $backupRoot -Directory |
+            Where-Object { $_.Name -like 'backup-*' } |
+            Sort-Object CreationTime -Descending
+
+          if ($allBackups.Count -gt $retentionCount) {
+            $toDelete = $allBackups | Select-Object -Skip $retentionCount
+            foreach ($dir in $toDelete) {
+              Remove-Item -Recurse -Force $dir.FullName
+              Write-Host "Pruned old backup: $($dir.Name)"
+            }
+          }
+
+      - name: Strip environment-managed config
+        uses: ./.github/actions/strip-env-config
+        with:
+          deploy-path: deploy-staging/
+
+      - name: Stop application pool
+        shell: pwsh
+        run: |
+          Stop-WebAppPool -Name '${{ vars.APP_POOL }}'
+
+      - name: Deploy files via robocopy
+        shell: pwsh
+        run: |
+          $src = 'deploy-staging\'
+          $dst = '${{ vars.SITE_PATH }}'
+          robocopy $src $dst /E /NFL /NDL /NJH /NJS
+          $rc = $LASTEXITCODE
+          if ($rc -ge 8) {
+            throw "robocopy failed with exit code $rc"
+          }
+          Write-Host "robocopy completed with exit code $rc (success)"
+
+      - name: Start application pool
+        shell: pwsh
+        run: |
+          Start-WebAppPool -Name '${{ vars.APP_POOL }}'
+
+      - name: Health check
+        if: vars.HEALTH_CHECK_URL != ''
+        shell: pwsh
+        run: |
+          $url = '${{ vars.HEALTH_CHECK_URL }}'
+          $maxAttempts = 5
+          $sleepSeconds = 6
+          $success = $false
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri $url -UseBasicParsing -ErrorAction Stop
+              if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                Write-Host "Health check passed on attempt $i (HTTP $($response.StatusCode))"
+                $success = $true
+                break
+              }
+              Write-Host "Health check attempt $i returned HTTP $($response.StatusCode)"
+            } catch {
+              Write-Host "Health check attempt $i failed: $_"
+            }
+            if ($i -lt $maxAttempts) {
+              Start-Sleep -Seconds $sleepSeconds
+            }
+          }
+          if (-not $success) {
+            throw "Health check failed after $maxAttempts attempts at $url"
+          }
+
+      - name: Record deployment
+        id: record
+        uses: ./.github/actions/record-deployment
+        with:
+          version: ${{ needs.validate.outputs.version }}
+          environment: ${{ inputs.environment }}
+          action-type: ${{ inputs.action-type }}
+          actor: ${{ github.actor }}
+          commit: ${{ github.sha }}
+          branch: ${{ github.ref_name }}
+
+      - name: Write job summary
+        shell: pwsh
+        run: |
+          $version  = '${{ needs.validate.outputs.version }}'
+          $env      = '${{ inputs.environment }}'
+          $action   = '${{ inputs.action-type }}'
+          $actor    = '${{ github.actor }}'
+          $sitePath = '${{ vars.SITE_PATH }}'
+          $publicUrl = '${{ vars.HEALTH_CHECK_URL }}'
+
+          $summary = @"
+          ## Deployment Summary
+
+          | Field      | Value        |
+          |------------|--------------|
+          | Environment | $env        |
+          | Version     | $version    |
+          | Action      | $action     |
+          | Actor       | $actor      |
+          | Site Path   | $sitePath   |
+          | Public URL  | $publicUrl  |
+          "@
+
+          $summary >> $env:GITHUB_STEP_SUMMARY

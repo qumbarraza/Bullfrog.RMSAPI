@@ -1,0 +1,46 @@
+name: Reset - Restore Environment to Latest Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        required: true
+        type: choice
+        options:
+          - vm-dev
+      confirmation:
+        description: For prod type RESET-PROD
+        required: false
+        type: string
+
+jobs:
+  resolve:
+    runs-on: [self-hosted, build]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      latest-version: ${{ steps.resolve.outputs.latest-version }}
+    steps:
+      - id: resolve
+        shell: pwsh
+        run: |
+          if ('${{ inputs.environment }}' -like '*prod*') {
+            if ('${{ inputs.confirmation }}' -ne 'RESET-PROD') {
+              Write-Error "Confirmation required for prod environment. Type RESET-PROD to confirm."
+              exit 1
+            }
+          }
+          $tag = Invoke-Expression "gh api repos/qumbarraza/Bullfrog.RMSAPI/releases/latest --jq .tag_name"
+          $ver = $tag -replace "^v",""
+          echo "latest-version=$ver" >> $env:GITHUB_OUTPUT
+
+  deploy:
+    needs: resolve
+    uses: ./.github/workflows/deploy-release.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ needs.resolve.outputs.latest-version }}
+      action-type: reset
+      skip-backup: false
+    secrets: inherit

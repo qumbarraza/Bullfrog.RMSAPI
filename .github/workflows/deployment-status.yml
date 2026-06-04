@@ -1,0 +1,67 @@
+name: Status - Cross-Environment Deployment Report
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * MON"
+
+jobs:
+  report:
+    strategy:
+      matrix:
+        environment: [vm-dev]
+      fail-fast: false
+    runs-on: [self-hosted, "${{ matrix.environment }}"]
+    environment: ${{ matrix.environment }}
+    continue-on-error: true
+    steps:
+      - name: Generate Deployment Status Report
+        shell: pwsh
+        run: |
+          $jsonPath = "C:\RMSApplicationFiles\current-deployment.json"
+          $logPath  = "C:\RMSApplicationFiles\deploy-history.log"
+
+          $cur  = $null
+          $hist = @()
+
+          if (Test-Path $jsonPath) {
+            $cur = Get-Content $jsonPath -Raw | ConvertFrom-Json
+          } else {
+            Write-Warning "No current-deployment.json found at $jsonPath"
+          }
+
+          if (Test-Path $logPath) {
+            $hist = Get-Content $logPath |
+                    Select-Object -Last 5 |
+                    ForEach-Object { ConvertFrom-Json $_ }
+          } else {
+            Write-Warning "No deploy-history.log found at $logPath"
+          }
+
+          $summary = @()
+          $summary += "## ${{ matrix.environment }}"
+          $summary += ""
+
+          if ($cur) {
+            $summary += "| Current Version | Action Type | Deployed By | Deployed At | Public URL |"
+            $summary += "| --- | --- | --- | --- | --- |"
+            $summary += "| $($cur.version) | $($cur.actionType) | $($cur.deployedBy) | $($cur.deployedAt) | ${{ vars.PUBLIC_URL }} |"
+          } else {
+            $summary += "> :warning: No deployment record found for this environment."
+          }
+
+          $summary += ""
+          $summary += "### Recent History (last 5)"
+          $summary += ""
+
+          if ($hist.Count -gt 0) {
+            $summary += "| Timestamp | Version | Action | Actor |"
+            $summary += "| --- | --- | --- | --- | --- |"
+            foreach ($entry in $hist) {
+              $summary += "| $($entry.timestamp) | $($entry.version) | $($entry.action) | $($entry.actor) |"
+            }
+          } else {
+            $summary += "> :warning: No deployment history found."
+          }
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
